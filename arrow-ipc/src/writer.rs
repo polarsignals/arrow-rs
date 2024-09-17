@@ -199,10 +199,10 @@ impl Default for IpcWriteOptions {
 pub struct IpcDataGenerator {}
 
 impl IpcDataGenerator {
-    pub fn schema_to_bytes(&self, schema: &Schema, write_options: &IpcWriteOptions) -> EncodedData {
+    pub fn schema_to_bytes(&self, schema: &Schema, dictionary_tracker: &mut DictionaryTracker, write_options: &IpcWriteOptions) -> EncodedData {
         let mut fbb = FlatBufferBuilder::new();
         let schema = {
-            let fb = crate::convert::schema_to_fb_offset(&mut fbb, schema);
+            let fb = crate::convert::schema_to_fb_offset(&mut fbb, dictionary_tracker, schema);
             fb.as_union_value()
         };
 
@@ -359,13 +359,6 @@ impl IpcDataGenerator {
     ) -> Result<(), ArrowError> {
         match column.data_type() {
             DataType::Dictionary(_key_type, _value_type) => {
-                let dict_id = dict_id_seq
-                    .next()
-                    .or_else(|| field.dict_id())
-                    .ok_or_else(|| {
-                        ArrowError::IpcError(format!("no dict id for field {}", field.name()))
-                    })?;
-
                 let dict_data = column.to_data();
                 let dict_values = &dict_data.child_data()[0];
 
@@ -378,6 +371,16 @@ impl IpcDataGenerator {
                     write_options,
                     dict_id_seq,
                 )?;
+
+                // It's importnat to only take the dict_id at this point, because the dict ID
+                // sequence is assigned depth-first, so we need to first encode children and have
+                // them take their assigned dict IDs before we take the dict ID for this field.
+                let dict_id = dict_id_seq
+                    .next()
+                    .or_else(|| field.dict_id())
+                    .ok_or_else(|| {
+                        ArrowError::IpcError(format!("no dict id for field {}", field.name()))
+                    })?;
 
                 let emit = dictionary_tracker.insert(dict_id, column)?;
 
@@ -887,9 +890,13 @@ impl<W: Write> FileWriter<W> {
         writer.write_all(&super::ARROW_MAGIC)?;
         writer.write_all(&PADDING[..pad_len])?;
         // write the schema, set the written bytes to the schema + header
-        let encoded_message = data_gen.schema_to_bytes(schema, &write_options);
-        let (meta, data) = write_message(&mut writer, encoded_message, &write_options)?;
         let preserve_dict_id = write_options.preserve_dict_id;
+        let mut dictionary_tracker = DictionaryTracker::new_with_preserve_dict_id(
+            true,
+            preserve_dict_id,
+        );
+        let encoded_message = data_gen.schema_to_bytes(schema, &mut dictionary_tracker, &write_options);
+        let (meta, data) = write_message(&mut writer, encoded_message, &write_options)?;
         Ok(Self {
             writer,
             write_options,
@@ -898,10 +905,7 @@ impl<W: Write> FileWriter<W> {
             dictionary_blocks: vec![],
             record_blocks: vec![],
             finished: false,
-            dictionary_tracker: DictionaryTracker::new_with_preserve_dict_id(
-                true,
-                preserve_dict_id,
-            ),
+            dictionary_tracker,
             custom_metadata: HashMap::new(),
             data_gen,
         })
@@ -960,7 +964,7 @@ impl<W: Write> FileWriter<W> {
         let mut fbb = FlatBufferBuilder::new();
         let dictionaries = fbb.create_vector(&self.dictionary_blocks);
         let record_batches = fbb.create_vector(&self.record_blocks);
-        let schema = crate::convert::schema_to_fb_offset(&mut fbb, &self.schema);
+        let schema = crate::convert::schema_to_fb_offset(&mut fbb, &mut self.dictionary_tracker, &self.schema);
         let fb_custom_metadata = (!self.custom_metadata.is_empty())
             .then(|| crate::convert::metadata_to_fb(&mut fbb, &self.custom_metadata));
 
@@ -1086,18 +1090,20 @@ impl<W: Write> StreamWriter<W> {
         write_options: IpcWriteOptions,
     ) -> Result<Self, ArrowError> {
         let data_gen = IpcDataGenerator::default();
-        // write the schema, set the written bytes to the schema
-        let encoded_message = data_gen.schema_to_bytes(schema, &write_options);
-        write_message(&mut writer, encoded_message, &write_options)?;
         let preserve_dict_id = write_options.preserve_dict_id;
+        let mut dictionary_tracker = DictionaryTracker::new_with_preserve_dict_id(
+            false,
+            preserve_dict_id,
+        );
+
+        // write the schema, set the written bytes to the schema
+        let encoded_message = data_gen.schema_to_bytes(schema, &mut dictionary_tracker, &write_options);
+        write_message(&mut writer, encoded_message, &write_options)?;
         Ok(Self {
             writer,
             write_options,
             finished: false,
-            dictionary_tracker: DictionaryTracker::new_with_preserve_dict_id(
-                false,
-                preserve_dict_id,
-            ),
+            dictionary_tracker,
             data_gen,
         })
     }
