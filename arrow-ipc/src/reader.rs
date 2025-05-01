@@ -156,7 +156,6 @@ impl RecordBatchDecoder<'_> {
                 let index_node = self.next_node(field)?;
                 let index_buffers = [self.next_buffer()?, self.next_buffer()?];
 
-                #[allow(deprecated)]
                 let dict_id = field.dict_id().ok_or_else(|| {
                     ArrowError::ParseError(format!("Field {field} does not have dict id"))
                 })?;
@@ -662,7 +661,6 @@ fn read_dictionary_impl(
     }
 
     let id = batch.id();
-    #[allow(deprecated)]
     let fields_using_this_dictionary = schema.fields_with_dict_id(id);
     let first_field = fields_using_this_dictionary.first().ok_or_else(|| {
         ArrowError::InvalidArgumentError(format!("dictionary id {id} not found in schema"))
@@ -1963,13 +1961,19 @@ mod tests {
 
     #[test]
     fn test_roundtrip_nested_dict_no_preserve_dict_id() {
-        let inner: DictionaryArray<Int32Type> = vec!["a", "b", "a"].into_iter().collect();
+        let inner1: DictionaryArray<Int32Type> = vec!["a", "b", "a"].into_iter().collect();
+        let inner2: DictionaryArray<Int32Type> = vec!["a", "b", "a"].into_iter().collect();
 
-        let array = Arc::new(inner) as ArrayRef;
+        let array1 = Arc::new(inner1) as ArrayRef;
+        let array2 = Arc::new(inner2) as ArrayRef;
 
-        let dctfield = Arc::new(Field::new("dict", array.data_type().clone(), false));
+        let dctfield1 = Arc::new(Field::new("dict", array1.data_type().clone(), false));
+        let dctfield2 = Arc::new(Field::new("dict", array2.data_type().clone(), false));
 
-        let s = StructArray::from(vec![(dctfield, array)]);
+        let s = StructArray::from(vec![
+            (dctfield1, array1),
+            (dctfield2, array2),
+        ]);
         let struct_array = Arc::new(s) as ArrayRef;
 
         let schema = Arc::new(Schema::new(vec![Field::new(
@@ -1984,8 +1988,7 @@ mod tests {
         let mut writer = crate::writer::FileWriter::try_new_with_options(
             &mut buf,
             batch.schema_ref(),
-            #[allow(deprecated)]
-            IpcWriteOptions::default().with_preserve_dict_id(false),
+            IpcWriteOptions::default(),
         )
         .unwrap();
         writer.write(&batch).unwrap();
@@ -1994,7 +1997,9 @@ mod tests {
 
         let mut reader = FileReader::try_new(std::io::Cursor::new(buf), None).unwrap();
 
-        assert_eq!(batch, reader.next().unwrap().unwrap());
+        let ipc_batch = reader.next().unwrap().unwrap();
+        assert_eq!(batch, ipc_batch);
+        assert_eq!(batch.schema(), ipc_batch.schema());
     }
 
     fn check_union_with_builder(mut builder: UnionBuilder) {
@@ -2129,7 +2134,6 @@ mod tests {
         let key_dict_keys = Int8Array::from_iter_values([0, 0, 2, 1, 1, 3]);
         let key_dict_array = DictionaryArray::new(key_dict_keys, values);
 
-        #[allow(deprecated)]
         let keys_field = Arc::new(Field::new_dict(
             "keys",
             DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
@@ -2137,7 +2141,6 @@ mod tests {
             1,
             false,
         ));
-        #[allow(deprecated)]
         let values_field = Arc::new(Field::new_dict(
             "values",
             DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
@@ -2218,7 +2221,6 @@ mod tests {
     #[test]
     fn test_roundtrip_stream_dict_of_list_of_dict() {
         // list
-        #[allow(deprecated)]
         let list_data_type = DataType::List(Arc::new(Field::new_dict(
             "item",
             DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
@@ -2230,7 +2232,6 @@ mod tests {
         test_roundtrip_stream_dict_of_list_of_dict_impl::<i32, i32>(list_data_type, offsets);
 
         // large list
-        #[allow(deprecated)]
         let list_data_type = DataType::LargeList(Arc::new(Field::new_dict(
             "item",
             DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
@@ -2249,7 +2250,6 @@ mod tests {
         let dict_array = DictionaryArray::new(keys, Arc::new(values));
         let dict_data = dict_array.into_data();
 
-        #[allow(deprecated)]
         let list_data_type = DataType::FixedSizeList(
             Arc::new(Field::new_dict(
                 "item",
@@ -2340,7 +2340,6 @@ mod tests {
 
         let key_dict_keys = Int8Array::from_iter_values([0, 0, 1, 2, 0, 1, 3]);
         let key_dict_array = DictionaryArray::new(key_dict_keys, utf8_view_array.clone());
-        #[allow(deprecated)]
         let keys_field = Arc::new(Field::new_dict(
             "keys",
             DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8View)),
@@ -2351,7 +2350,6 @@ mod tests {
 
         let value_dict_keys = Int8Array::from_iter_values([0, 3, 0, 1, 2, 0, 1]);
         let value_dict_array = DictionaryArray::new(value_dict_keys, bin_view_array);
-        #[allow(deprecated)]
         let values_field = Arc::new(Field::new_dict(
             "values",
             DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::BinaryView)),
@@ -2417,8 +2415,7 @@ mod tests {
         .unwrap();
 
         let gen = IpcDataGenerator {};
-        #[allow(deprecated)]
-        let mut dict_tracker = DictionaryTracker::new_with_preserve_dict_id(false, true);
+        let mut dict_tracker = DictionaryTracker::new(false);
         let (_, encoded) = gen
             .encoded_batch(&batch, &mut dict_tracker, &Default::default())
             .unwrap();
@@ -2456,8 +2453,7 @@ mod tests {
         .unwrap();
 
         let gen = IpcDataGenerator {};
-        #[allow(deprecated)]
-        let mut dict_tracker = DictionaryTracker::new_with_preserve_dict_id(false, true);
+        let mut dict_tracker = DictionaryTracker::new(false);
         let (_, encoded) = gen
             .encoded_batch(&batch, &mut dict_tracker, &Default::default())
             .unwrap();
@@ -2633,7 +2629,6 @@ mod tests {
                 ["a", "b"]
                     .iter()
                     .map(|name| {
-                        #[allow(deprecated)]
                         Field::new_dict(
                             name.to_string(),
                             DataType::Dictionary(
@@ -2668,8 +2663,7 @@ mod tests {
             let mut writer = crate::writer::StreamWriter::try_new_with_options(
                 &mut buf,
                 batch.schema().as_ref(),
-                #[allow(deprecated)]
-                crate::writer::IpcWriteOptions::default().with_preserve_dict_id(false),
+                crate::writer::IpcWriteOptions::default(),
             )
             .expect("Failed to create StreamWriter");
             writer.write(&batch).expect("Failed to write RecordBatch");

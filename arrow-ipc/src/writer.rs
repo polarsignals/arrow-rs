@@ -65,15 +65,6 @@ pub struct IpcWriteOptions {
     /// Compression, if desired. Will result in a runtime error
     /// if the corresponding feature is not enabled
     batch_compression_type: Option<crate::CompressionType>,
-    /// Flag indicating whether the writer should preserve the dictionary IDs defined in the
-    /// schema or generate unique dictionary IDs internally during encoding.
-    ///
-    /// Defaults to `false`
-    #[deprecated(
-        since = "54.0.0",
-        note = "The ability to preserve dictionary IDs will be removed. With it, all fields related to it."
-    )]
-    preserve_dict_id: bool,
 }
 
 impl IpcWriteOptions {
@@ -116,13 +107,11 @@ impl IpcWriteOptions {
             | crate::MetadataVersion::V3 => Err(ArrowError::InvalidArgumentError(
                 "Writing IPC metadata version 3 and lower not supported".to_string(),
             )),
-            #[allow(deprecated)]
             crate::MetadataVersion::V4 => Ok(Self {
                 alignment,
                 write_legacy_ipc_format,
                 metadata_version,
                 batch_compression_type: None,
-                preserve_dict_id: false,
             }),
             crate::MetadataVersion::V5 => {
                 if write_legacy_ipc_format {
@@ -130,13 +119,11 @@ impl IpcWriteOptions {
                         "Legacy IPC format only supported on metadata version 4".to_string(),
                     ))
                 } else {
-                    #[allow(deprecated)]
                     Ok(Self {
                         alignment,
                         write_legacy_ipc_format,
                         metadata_version,
                         batch_compression_type: None,
-                        preserve_dict_id: false,
                     })
                 }
             }
@@ -145,45 +132,15 @@ impl IpcWriteOptions {
             ))),
         }
     }
-
-    /// Return whether the writer is configured to preserve the dictionary IDs
-    /// defined in the schema
-    #[deprecated(
-        since = "54.0.0",
-        note = "The ability to preserve dictionary IDs will be removed. With it, all functions related to it."
-    )]
-    pub fn preserve_dict_id(&self) -> bool {
-        #[allow(deprecated)]
-        self.preserve_dict_id
-    }
-
-    /// Set whether the IPC writer should preserve the dictionary IDs in the schema
-    /// or auto-assign unique dictionary IDs during encoding (defaults to true)
-    ///
-    /// If this option is true,  the application must handle assigning ids
-    /// to the dictionary batches in order to encode them correctly
-    ///
-    /// The default will change to `false`  in future releases
-    #[deprecated(
-        since = "54.0.0",
-        note = "The ability to preserve dictionary IDs will be removed. With it, all functions related to it."
-    )]
-    #[allow(deprecated)]
-    pub fn with_preserve_dict_id(mut self, preserve_dict_id: bool) -> Self {
-        self.preserve_dict_id = preserve_dict_id;
-        self
-    }
 }
 
 impl Default for IpcWriteOptions {
     fn default() -> Self {
-        #[allow(deprecated)]
         Self {
             alignment: 64,
             write_legacy_ipc_format: false,
             metadata_version: crate::MetadataVersion::V5,
             batch_compression_type: None,
-            preserve_dict_id: false,
         }
     }
 }
@@ -236,39 +193,8 @@ impl IpcDataGenerator {
     ) -> EncodedData {
         let mut fbb = FlatBufferBuilder::new();
         let schema = {
-            let fb = IpcSchemaEncoder::new()
-                .with_dictionary_tracker(dictionary_tracker)
+            let fb = IpcSchemaEncoder::new(dictionary_tracker)
                 .schema_to_fb_offset(&mut fbb, schema);
-            fb.as_union_value()
-        };
-
-        let mut message = crate::MessageBuilder::new(&mut fbb);
-        message.add_version(write_options.metadata_version);
-        message.add_header_type(crate::MessageHeader::Schema);
-        message.add_bodyLength(0);
-        message.add_header(schema);
-        // TODO: custom metadata
-        let data = message.finish();
-        fbb.finish(data, None);
-
-        let data = fbb.finished_data();
-        EncodedData {
-            ipc_message: data.to_vec(),
-            arrow_data: vec![],
-        }
-    }
-
-    #[deprecated(
-        since = "54.0.0",
-        note = "Use `schema_to_bytes_with_dictionary_tracker` instead. This function signature of `schema_to_bytes_with_dictionary_tracker` in the next release."
-    )]
-    /// Converts a schema to an IPC message and returns it encoded inside [EncodedData] as a flatbuffer
-    pub fn schema_to_bytes(&self, schema: &Schema, write_options: &IpcWriteOptions) -> EncodedData {
-        let mut fbb = FlatBufferBuilder::new();
-        let schema = {
-            #[allow(deprecated)]
-            // This will be replaced with the IpcSchemaConverter in the next release.
-            let fb = crate::convert::schema_to_fb_offset(&mut fbb, schema);
             fb.as_union_value()
         };
 
@@ -441,10 +367,8 @@ impl IpcDataGenerator {
                 // It's importnat to only take the dict_id at this point, because the dict ID
                 // sequence is assigned depth-first, so we need to first encode children and have
                 // them take their assigned dict IDs before we take the dict ID for this field.
-                #[allow(deprecated)]
                 let dict_id = dict_id_seq
                     .next()
-                    .or_else(|| field.dict_id())
                     .ok_or_else(|| {
                         ArrowError::IpcError(format!("no dict id for field {}", field.name()))
                     })?;
@@ -789,11 +713,6 @@ pub struct DictionaryTracker {
     written: HashMap<i64, ArrayData>,
     dict_ids: Vec<i64>,
     error_on_replacement: bool,
-    #[deprecated(
-        since = "54.0.0",
-        note = "The ability to preserve dictionary IDs will be removed. With it, all fields related to it."
-    )]
-    preserve_dict_id: bool,
 }
 
 impl DictionaryTracker {
@@ -808,57 +727,21 @@ impl DictionaryTracker {
     /// the last seen dictionary ID (or using `0` if no other dictionary IDs have been
     /// seen)
     pub fn new(error_on_replacement: bool) -> Self {
-        #[allow(deprecated)]
         Self {
             written: HashMap::new(),
             dict_ids: Vec::new(),
             error_on_replacement,
-            preserve_dict_id: false,
         }
     }
 
-    /// Create a new [`DictionaryTracker`].
-    ///
-    /// If `error_on_replacement`
-    /// is true, an error will be generated if an update to an
-    /// existing dictionary is attempted.
-    #[deprecated(
-        since = "54.0.0",
-        note = "The ability to preserve dictionary IDs will be removed. With it, all functions related to it."
-    )]
-    pub fn new_with_preserve_dict_id(error_on_replacement: bool, preserve_dict_id: bool) -> Self {
-        #[allow(deprecated)]
-        Self {
-            written: HashMap::new(),
-            dict_ids: Vec::new(),
-            error_on_replacement,
-            preserve_dict_id,
-        }
-    }
-
-    /// Set the dictionary ID for `field`.
-    ///
-    /// If `preserve_dict_id` is true, this will return the `dict_id` in `field` (or panic if `field` does
-    /// not have a `dict_id` defined).
-    ///
-    /// If `preserve_dict_id` is false, this will return the value of the last `dict_id` assigned incremented by 1
-    /// or 0 in the case where no dictionary IDs have yet been assigned
-    #[deprecated(
-        since = "54.0.0",
-        note = "The ability to preserve dictionary IDs will be removed. With it, all functions related to it."
-    )]
-    pub fn set_dict_id(&mut self, field: &Field) -> i64 {
-        #[allow(deprecated)]
-        let next = if self.preserve_dict_id {
-            #[allow(deprecated)]
-            field.dict_id().expect("no dict_id in field")
-        } else {
-            self.dict_ids
+    /// This will return the value of the last `dict_id` assigned incremented by 1 or 0 in the case
+    /// where no dictionary IDs have yet been assigned.
+    pub fn next_dict_id(&mut self) -> i64 {
+        let next = self.dict_ids
                 .last()
                 .copied()
                 .map(|i| i + 1)
-                .unwrap_or_default()
-        };
+                .unwrap_or_default();
 
         self.dict_ids.push(next);
         next
@@ -995,11 +878,8 @@ impl<W: Write> FileWriter<W> {
         writer.write_all(&super::ARROW_MAGIC)?;
         writer.write_all(&PADDING[..pad_len])?;
         // write the schema, set the written bytes to the schema + header
-        #[allow(deprecated)]
-        let preserve_dict_id = write_options.preserve_dict_id;
-        #[allow(deprecated)]
         let mut dictionary_tracker =
-            DictionaryTracker::new_with_preserve_dict_id(true, preserve_dict_id);
+            DictionaryTracker::new(true);
         let encoded_message = data_gen.schema_to_bytes_with_dictionary_tracker(
             schema,
             &mut dictionary_tracker,
@@ -1074,13 +954,9 @@ impl<W: Write> FileWriter<W> {
         let mut fbb = FlatBufferBuilder::new();
         let dictionaries = fbb.create_vector(&self.dictionary_blocks);
         let record_batches = fbb.create_vector(&self.record_blocks);
-        #[allow(deprecated)]
-        let preserve_dict_id = self.write_options.preserve_dict_id;
-        #[allow(deprecated)]
         let mut dictionary_tracker =
-            DictionaryTracker::new_with_preserve_dict_id(true, preserve_dict_id);
-        let schema = IpcSchemaEncoder::new()
-            .with_dictionary_tracker(&mut dictionary_tracker)
+            DictionaryTracker::new(true);
+        let schema = IpcSchemaEncoder::new(&mut dictionary_tracker)
             .schema_to_fb_offset(&mut fbb, &self.schema);
         let fb_custom_metadata = (!self.custom_metadata.is_empty())
             .then(|| crate::convert::metadata_to_fb(&mut fbb, &self.custom_metadata));
@@ -1229,11 +1105,8 @@ impl<W: Write> StreamWriter<W> {
         write_options: IpcWriteOptions,
     ) -> Result<Self, ArrowError> {
         let data_gen = IpcDataGenerator::default();
-        #[allow(deprecated)]
-        let preserve_dict_id = write_options.preserve_dict_id;
-        #[allow(deprecated)]
         let mut dictionary_tracker =
-            DictionaryTracker::new_with_preserve_dict_id(false, preserve_dict_id);
+            DictionaryTracker::new(false);
 
         // write the schema, set the written bytes to the schema
         let encoded_message = data_gen.schema_to_bytes_with_dictionary_tracker(
@@ -2140,7 +2013,6 @@ mod tests {
         let array = Arc::new(inner) as ArrayRef;
 
         // Dict field with id 2
-        #[allow(deprecated)]
         let dctfield = Field::new_dict("dict", array.data_type().clone(), false, 2, false);
         let union_fields = [(0, Arc::new(dctfield))].into_iter().collect();
 
@@ -2155,17 +2027,18 @@ mod tests {
             false,
         )]));
 
+        let gen = IpcDataGenerator {};
+        let mut dict_tracker = DictionaryTracker::new(false);
+        gen.schema_to_bytes_with_dictionary_tracker(&schema, &mut dict_tracker, &Default::default());
+
         let batch = RecordBatch::try_new(schema, vec![Arc::new(union)]).unwrap();
 
-        let gen = IpcDataGenerator {};
-        #[allow(deprecated)]
-        let mut dict_tracker = DictionaryTracker::new_with_preserve_dict_id(false, true);
         gen.encoded_batch(&batch, &mut dict_tracker, &Default::default())
             .unwrap();
 
         // The encoder will assign dict IDs itself to ensure uniqueness and ignore the dict ID in the schema
         // so we expect the dict will be keyed to 0
-        assert!(dict_tracker.written.contains_key(&2));
+        assert!(dict_tracker.written.contains_key(&0));
     }
 
     #[test]
@@ -2175,7 +2048,6 @@ mod tests {
         let array = Arc::new(inner) as ArrayRef;
 
         // Dict field with id 2
-        #[allow(deprecated)]
         let dctfield = Arc::new(Field::new_dict(
             "dict",
             array.data_type().clone(),
@@ -2193,15 +2065,18 @@ mod tests {
             false,
         )]));
 
+        let gen = IpcDataGenerator {};
+        let mut dict_tracker = DictionaryTracker::new(false);
+
+        gen.schema_to_bytes_with_dictionary_tracker(&schema, &mut dict_tracker, &Default::default());
+
         let batch = RecordBatch::try_new(schema, vec![struct_array]).unwrap();
 
-        let gen = IpcDataGenerator {};
-        #[allow(deprecated)]
-        let mut dict_tracker = DictionaryTracker::new_with_preserve_dict_id(false, true);
         gen.encoded_batch(&batch, &mut dict_tracker, &Default::default())
             .unwrap();
 
-        assert!(dict_tracker.written.contains_key(&2));
+        // We explicitly expect the dict ID to be 0 here, because the encoder will assign dict IDs itself.
+        assert!(dict_tracker.written.contains_key(&0));
     }
 
     fn write_union_file(options: IpcWriteOptions) {

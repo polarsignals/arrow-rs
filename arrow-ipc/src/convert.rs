@@ -49,8 +49,7 @@ use DataType::*;
 /// // Use a dictionary tracker to track dictionary id if needed
 ///  let mut dictionary_tracker = DictionaryTracker::new(true);
 /// // create a FlatBuffersBuilder that contains the encoded bytes
-///  let fb = IpcSchemaEncoder::new()
-///    .with_dictionary_tracker(&mut dictionary_tracker)
+///  let fb = IpcSchemaEncoder::new(&mut dictionary_tracker)
 ///    .schema_to_fb(&schema);
 ///
 /// // the bytes are in `fb.finished_data()`
@@ -63,30 +62,17 @@ use DataType::*;
 /// ```
 #[derive(Debug)]
 pub struct IpcSchemaEncoder<'a> {
-    dictionary_tracker: Option<&'a mut DictionaryTracker>,
-}
-
-impl Default for IpcSchemaEncoder<'_> {
-    fn default() -> Self {
-        Self::new()
-    }
+    dictionary_tracker: &'a mut DictionaryTracker,
 }
 
 impl<'a> IpcSchemaEncoder<'a> {
     /// Create a new schema encoder
-    pub fn new() -> IpcSchemaEncoder<'a> {
-        IpcSchemaEncoder {
-            dictionary_tracker: None,
-        }
-    }
-
-    /// Specify a dictionary tracker to use
-    pub fn with_dictionary_tracker(
-        mut self,
+    pub fn new(
         dictionary_tracker: &'a mut DictionaryTracker,
-    ) -> Self {
-        self.dictionary_tracker = Some(dictionary_tracker);
-        self
+    ) -> IpcSchemaEncoder<'a> {
+        IpcSchemaEncoder {
+            dictionary_tracker,
+        }
     }
 
     /// Serialize a schema in IPC format, returning a completed [`FlatBufferBuilder`]
@@ -127,12 +113,6 @@ impl<'a> IpcSchemaEncoder<'a> {
     }
 }
 
-/// Serialize a schema in IPC format
-#[deprecated(since = "54.0.0", note = "Use `IpcSchemaConverter`.")]
-pub fn schema_to_fb(schema: &Schema) -> FlatBufferBuilder<'_> {
-    IpcSchemaEncoder::new().schema_to_fb(schema)
-}
-
 /// Push a key-value metadata into a FlatBufferBuilder and return [WIPOffset]
 pub fn metadata_to_fb<'a>(
     fbb: &mut FlatBufferBuilder<'a>,
@@ -161,14 +141,14 @@ pub fn schema_to_fb_offset<'a>(
     fbb: &mut FlatBufferBuilder<'a>,
     schema: &Schema,
 ) -> WIPOffset<crate::Schema<'a>> {
-    IpcSchemaEncoder::new().schema_to_fb_offset(fbb, schema)
+    let mut dictionary_tracker = DictionaryTracker::new(true);
+    IpcSchemaEncoder::new(&mut dictionary_tracker).schema_to_fb_offset(fbb, schema)
 }
 
 /// Convert an IPC Field to Arrow Field
 impl From<crate::Field<'_>> for Field {
     fn from(field: crate::Field) -> Field {
         let arrow_field = if let Some(dictionary) = field.dictionary() {
-            #[allow(deprecated)]
             Field::new_dict(
                 field.name().unwrap(),
                 get_data_type(field, true),
@@ -512,7 +492,7 @@ pub(crate) struct FBFieldType<'b> {
 /// Create an IPC Field from an Arrow Field
 pub(crate) fn build_field<'a>(
     fbb: &mut FlatBufferBuilder<'a>,
-    dictionary_tracker: &mut Option<&mut DictionaryTracker>,
+    dictionary_tracker: &mut DictionaryTracker,
     field: &Field,
 ) -> WIPOffset<crate::Field<'a>> {
     // Optional custom metadata.
@@ -525,28 +505,14 @@ pub(crate) fn build_field<'a>(
     let field_type = get_fb_field_type(field.data_type(), dictionary_tracker, fbb);
 
     let fb_dictionary = if let Dictionary(index_type, _) = field.data_type() {
-        match dictionary_tracker {
-            Some(tracker) => Some(get_fb_dictionary(
-                index_type,
-                #[allow(deprecated)]
-                tracker.set_dict_id(field),
-                field
-                    .dict_is_ordered()
-                    .expect("All Dictionary types have `dict_is_ordered`"),
-                fbb,
-            )),
-            None => Some(get_fb_dictionary(
-                index_type,
-                #[allow(deprecated)]
-                field
-                    .dict_id()
-                    .expect("Dictionary type must have a dictionary id"),
-                field
-                    .dict_is_ordered()
-                    .expect("All Dictionary types have `dict_is_ordered`"),
-                fbb,
-            )),
-        }
+        Some(get_fb_dictionary(
+            index_type,
+            dictionary_tracker.next_dict_id(),
+            field
+                .dict_is_ordered()
+                .expect("All Dictionary types have `dict_is_ordered`"),
+            fbb,
+        ))
     } else {
         None
     };
@@ -574,7 +540,7 @@ pub(crate) fn build_field<'a>(
 /// Get the IPC type of a data type
 pub(crate) fn get_fb_field_type<'a>(
     data_type: &DataType,
-    dictionary_tracker: &mut Option<&mut DictionaryTracker>,
+    dictionary_tracker: &mut DictionaryTracker,
     fbb: &mut FlatBufferBuilder<'a>,
 ) -> FBFieldType<'a> {
     // some IPC implementations expect an empty list for child data, instead of a null value.
@@ -1154,7 +1120,6 @@ mod tests {
                     ),
                     true,
                 ),
-                #[allow(deprecated)]
                 Field::new_dict(
                     "dictionary<int32, utf8>",
                     DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
@@ -1162,7 +1127,6 @@ mod tests {
                     123,
                     true,
                 ),
-                #[allow(deprecated)]
                 Field::new_dict(
                     "dictionary<uint8, uint32>",
                     DataType::Dictionary(Box::new(DataType::UInt8), Box::new(DataType::UInt32)),
@@ -1176,8 +1140,7 @@ mod tests {
         );
 
         let mut dictionary_tracker = DictionaryTracker::new(true);
-        let fb = IpcSchemaEncoder::new()
-            .with_dictionary_tracker(&mut dictionary_tracker)
+        let fb = IpcSchemaEncoder::new(&mut dictionary_tracker)
             .schema_to_fb(&schema);
 
         // read back fields
