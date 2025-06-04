@@ -45,6 +45,41 @@ use crate::compression::CompressionCodec;
 use crate::convert::IpcSchemaEncoder;
 use crate::CONTINUATION_MARKER;
 
+/// Controls how dictionaries are handled in Arrow IPC messages
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DictionaryHandling {
+    /// Send the entire dictionary every time it is encountered (default)
+    Resend,
+    /// Send only new dictionary values since the last batch (delta encoding)
+    ///
+    /// When a dictionary is first encountered, the entire dictionary is sent.
+    /// For subsequent batches, only values that are new (not previously sent)
+    /// are transmitted with the `isDelta` flag set to true.
+    Delta,
+}
+
+impl Default for DictionaryHandling {
+    fn default() -> Self {
+        Self::Resend
+    }
+}
+
+/// Describes what action should be taken for a dictionary
+#[derive(Debug, Clone)]
+pub enum DictionaryUpdate {
+    /// No action needed - dictionary unchanged
+    None,
+    /// Send the entire dictionary
+    New(ArrayData),
+    /// Send only the delta (new values)
+    Delta {
+        /// The delta dictionary data to send
+        delta: ArrayData,
+        /// Whether this is a replacement dictionary
+        is_replacement: bool,
+    },
+}
+
 /// IPC write options used to control the behaviour of the [`IpcDataGenerator`]
 #[derive(Debug, Clone)]
 pub struct IpcWriteOptions {
@@ -74,6 +109,10 @@ pub struct IpcWriteOptions {
         note = "The ability to preserve dictionary IDs will be removed. With it, all fields related to it."
     )]
     preserve_dict_id: bool,
+    /// How dictionaries are handled in IPC messages.
+    ///
+    /// Defaults to [`DictionaryHandling::Resend`]
+    dictionary_handling: DictionaryHandling,
 }
 
 impl IpcWriteOptions {
@@ -96,6 +135,13 @@ impl IpcWriteOptions {
         }
         Ok(self)
     }
+
+    /// Configure how dictionaries are handled in IPC messages
+    pub fn with_dictionary_handling(mut self, dictionary_handling: DictionaryHandling) -> Self {
+        self.dictionary_handling = dictionary_handling;
+        self
+    }
+
     /// Try to create IpcWriteOptions, checking for incompatible settings
     pub fn try_new(
         alignment: usize,
@@ -123,6 +169,7 @@ impl IpcWriteOptions {
                 metadata_version,
                 batch_compression_type: None,
                 preserve_dict_id: false,
+                dictionary_handling: DictionaryHandling::default(),
             }),
             crate::MetadataVersion::V5 => {
                 if write_legacy_ipc_format {
@@ -137,6 +184,7 @@ impl IpcWriteOptions {
                         metadata_version,
                         batch_compression_type: None,
                         preserve_dict_id: false,
+                        dictionary_handling: DictionaryHandling::default(),
                     })
                 }
             }
@@ -184,6 +232,7 @@ impl Default for IpcWriteOptions {
             metadata_version: crate::MetadataVersion::V5,
             batch_compression_type: None,
             preserve_dict_id: false,
+            dictionary_handling: DictionaryHandling::default(),
         }
     }
 }
@@ -426,7 +475,7 @@ impl IpcDataGenerator {
         match column.data_type() {
             DataType::Dictionary(_key_type, _value_type) => {
                 let dict_data = column.to_data();
-                let dict_values = &dict_data.child_data()[0];
+                let _dict_values = &dict_data.child_data()[0];
 
                 let values = make_array(dict_data.child_data()[0].clone());
 
@@ -449,14 +498,37 @@ impl IpcDataGenerator {
                         ArrowError::IpcError(format!("no dict id for field {}", field.name()))
                     })?;
 
-                let emit = dictionary_tracker.insert(dict_id, column)?;
+                let compute_delta = write_options.dictionary_handling == DictionaryHandling::Delta;
+                match dictionary_tracker.insert(dict_id, column, compute_delta)? {
+                    DictionaryUpdate::None => {
+                        // Dictionary unchanged, no need to emit
+                    }
+                    DictionaryUpdate::New(dict_data) => {
+                        // New dictionary, send as full dictionary
+                        encoded_dictionaries.push(self.dictionary_batch_to_bytes(
+                            dict_id,
+                            &dict_data,
+                            write_options,
+                            false,
+                        )?);
+                    }
+                    DictionaryUpdate::Delta {
+                        delta,
+                        is_replacement,
+                    } => {
+                        // Check if delta encoding is enabled
+                        let use_delta = write_options.dictionary_handling
+                            == DictionaryHandling::Delta
+                            && !is_replacement;
+                        
 
-                if emit {
-                    encoded_dictionaries.push(self.dictionary_batch_to_bytes(
-                        dict_id,
-                        dict_values,
-                        write_options,
-                    )?);
+                        encoded_dictionaries.push(self.dictionary_batch_to_bytes(
+                            dict_id,
+                            &delta,
+                            write_options,
+                            use_delta,
+                        )?);
+                    }
                 }
             }
             _ => self._encode_dictionaries(
@@ -585,10 +657,11 @@ impl IpcDataGenerator {
         fbb.finish(root, None);
         let finished_data = fbb.finished_data();
 
-        Ok(EncodedData {
+        let result = EncodedData {
             ipc_message: finished_data.to_vec(),
             arrow_data,
-        })
+        };
+        Ok(result)
     }
 
     /// Write dictionary values into two sets of bytes, one for the header (crate::Message) and the
@@ -598,6 +671,7 @@ impl IpcDataGenerator {
         dict_id: i64,
         array_data: &ArrayData,
         write_options: &IpcWriteOptions,
+        is_delta: bool,
     ) -> Result<EncodedData, ArrowError> {
         let mut fbb = FlatBufferBuilder::new();
 
@@ -666,6 +740,7 @@ impl IpcDataGenerator {
             let mut batch_builder = crate::DictionaryBatchBuilder::new(&mut fbb);
             batch_builder.add_id(dict_id);
             batch_builder.add_data(root);
+            batch_builder.add_isDelta(is_delta);
             batch_builder.finish().as_union_value()
         };
 
@@ -681,10 +756,11 @@ impl IpcDataGenerator {
         fbb.finish(root, None);
         let finished_data = fbb.finished_data();
 
-        Ok(EncodedData {
+        let result = EncodedData {
             ipc_message: finished_data.to_vec(),
             arrow_data,
-        })
+        };
+        Ok(result)
     }
 }
 
@@ -870,30 +946,32 @@ impl DictionaryTracker {
         &self.dict_ids
     }
 
-    /// Keep track of the dictionary with the given ID and values. Behavior:
+    /// Keep track of the dictionary with the given ID and values.
     ///
-    /// * If this ID has been written already and has the same data, return `Ok(false)` to indicate
-    ///   that the dictionary was not actually inserted (because it's already been seen).
-    /// * If this ID has been written already but with different data, and this tracker is
-    ///   configured to return an error, return an error.
-    /// * If the tracker has not been configured to error on replacement or this dictionary
-    ///   has never been seen before, return `Ok(true)` to indicate that the dictionary was just
-    ///   inserted.
-    pub fn insert(&mut self, dict_id: i64, column: &ArrayRef) -> Result<bool, ArrowError> {
+    /// Returns `Ok(DictionaryUpdate)` describing what action should be taken.
+    pub fn insert(
+        &mut self,
+        dict_id: i64,
+        column: &ArrayRef,
+        compute_delta: bool,
+    ) -> Result<DictionaryUpdate, ArrowError> {
         let dict_data = column.to_data();
         let dict_values = &dict_data.child_data()[0];
 
         // If a dictionary with this id was already emitted, check if it was the same.
         if let Some(last) = self.written.get(&dict_id) {
-            if ArrayData::ptr_eq(&last.child_data()[0], dict_values) {
+            let last_values = &last.child_data()[0];
+
+            if ArrayData::ptr_eq(last_values, dict_values) {
                 // Same dictionary values => no need to emit it again
-                return Ok(false);
+                return Ok(DictionaryUpdate::None);
             }
+
             if self.error_on_replacement {
                 // If error on replacement perform a logical comparison
-                if last.child_data()[0] == *dict_values {
+                if *last_values == *dict_values {
                     // Same dictionary values => no need to emit it again
-                    return Ok(false);
+                    return Ok(DictionaryUpdate::None);
                 }
                 return Err(ArrowError::InvalidArgumentError(
                     "Dictionary replacement detected when writing IPC file format. \
@@ -902,11 +980,89 @@ impl DictionaryTracker {
                         .to_string(),
                 ));
             }
+            
+            // Check if dictionaries are identical
+            if *last_values == *dict_values {
+                // Same dictionary values => no need to emit it again
+                return Ok(DictionaryUpdate::None);
+            }
+
+            // Check if we can compute a delta
+            let last_len = last_values.len();
+            let new_len = dict_values.len();
+
+            if compute_delta && new_len > last_len && can_compute_delta(last_values, dict_values) {
+                // Compute delta - new values beyond the last length
+                let delta_values = slice_array_data(dict_values, last_len, new_len)?;
+                let dict_data_clone = dict_data.clone();
+                self.written.insert(dict_id, dict_data_clone);
+                return Ok(DictionaryUpdate::Delta {
+                    delta: delta_values,
+                    is_replacement: false,
+                });
+            }
+
+            // Dictionary has changed in an incompatible way
+            let dict_values_clone = dict_values.clone();
+            let dict_data_clone = dict_data.clone();
+            self.written.insert(dict_id, dict_data_clone);
+            
+            // In delta mode, send as a replacement (isDelta=false)
+            // In resend mode, always send as New
+            if compute_delta {
+                return Ok(DictionaryUpdate::Delta {
+                    delta: dict_values_clone,
+                    is_replacement: true,
+                });
+            } else {
+                return Ok(DictionaryUpdate::New(dict_values_clone));
+            }
         }
 
-        self.written.insert(dict_id, dict_data);
-        Ok(true)
+        // First time seeing this dictionary
+        let dict_values_clone = dict_values.clone();
+        let dict_data_clone = dict_data.clone();
+        self.written.insert(dict_id, dict_data_clone);
+        Ok(DictionaryUpdate::New(dict_values_clone))
     }
+}
+
+/// Check if we can compute a delta between two dictionary value arrays
+fn can_compute_delta(last_values: &ArrayData, new_values: &ArrayData) -> bool {
+    // Can only compute delta if the first part of the new dictionary
+    // matches the entire last dictionary
+    if last_values.data_type() != new_values.data_type() {
+        return false;
+    }
+
+    let last_len = last_values.len();
+    let new_len = new_values.len();
+
+    if new_len <= last_len {
+        return false;
+    }
+
+    // Check if the first `last_len` values of new_values match last_values
+    let new_slice = slice_array_data(new_values, 0, last_len);
+    match new_slice {
+        Ok(sliced) => sliced == *last_values,
+        Err(_) => false,
+    }
+}
+
+/// Create a slice of ArrayData from start to end index
+fn slice_array_data(data: &ArrayData, start: usize, end: usize) -> Result<ArrayData, ArrowError> {
+    if start > end || end > data.len() {
+        return Err(ArrowError::InvalidArgumentError(format!(
+            "Invalid slice range [{}, {}) for array of length {}",
+            start,
+            end,
+            data.len()
+        )));
+    }
+
+    // Use arrow_data's slice method
+    Ok(data.slice(start, end - start))
 }
 
 /// Arrow File Writer

@@ -38,6 +38,7 @@ use arrow_array::*;
 use arrow_buffer::{ArrowNativeType, BooleanBuffer, Buffer, MutableBuffer, ScalarBuffer};
 use arrow_data::{ArrayData, ArrayDataBuilder, UnsafeFlag};
 use arrow_schema::*;
+use arrow_select::concat::concat;
 
 use crate::compression::CompressionCodec;
 use crate::{Block, FieldNode, Message, MetadataVersion, CONTINUATION_MARKER};
@@ -679,11 +680,7 @@ fn read_dictionary_impl(
     require_alignment: bool,
     skip_validation: UnsafeFlag,
 ) -> Result<(), ArrowError> {
-    if batch.isDelta() {
-        return Err(ArrowError::InvalidArgumentError(
-            "delta dictionary batches not supported".to_string(),
-        ));
-    }
+    let is_delta = batch.isDelta();
 
     let id = batch.id();
     #[allow(deprecated)]
@@ -722,10 +719,42 @@ fn read_dictionary_impl(
 
     // We don't currently record the isOrdered field. This could be general
     // attributes of arrays.
-    // Add (possibly multiple) array refs to the dictionaries array.
-    dictionaries_by_id.insert(id, dictionary_values.clone());
+
+    if is_delta {
+        // For delta dictionaries, append new values to existing dictionary
+        match dictionaries_by_id.get(&id) {
+            Some(existing_dict) => {
+                // Concatenate existing dictionary with delta values
+                let concatenated = concatenate_dictionaries(existing_dict, &dictionary_values)?;
+                dictionaries_by_id.insert(id, concatenated);
+            }
+            None => {
+                // First dictionary batch should not be a delta
+                return Err(ArrowError::InvalidArgumentError(
+                    "Received delta dictionary batch without initial dictionary".to_string(),
+                ));
+            }
+        }
+    } else {
+        // Add (possibly multiple) array refs to the dictionaries array.
+        dictionaries_by_id.insert(id, dictionary_values.clone());
+    }
 
     Ok(())
+}
+
+/// Concatenate two dictionary arrays for delta dictionary merging
+fn concatenate_dictionaries(existing: &ArrayRef, delta: &ArrayRef) -> Result<ArrayRef, ArrowError> {
+    if existing.data_type() != delta.data_type() {
+        return Err(ArrowError::InvalidArgumentError(format!(
+            "Cannot concatenate dictionaries with different types: {:?} vs {:?}",
+            existing.data_type(),
+            delta.data_type()
+        )));
+    }
+
+    let arrays = vec![existing.as_ref(), delta.as_ref()];
+    concat(&arrays)
 }
 
 /// Read the data for a given block
