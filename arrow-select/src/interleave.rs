@@ -17,6 +17,7 @@
 
 //! Interleave elements from multiple arrays
 
+use crate::concat::concat;
 use crate::dictionary::{merge_dictionary_values, should_merge_dictionary_values};
 use arrow_array::builder::{BooleanBufferBuilder, PrimitiveBuilder};
 use arrow_array::cast::AsArray;
@@ -198,7 +199,7 @@ fn interleave_dictionaries<K: ArrowDictionaryKeyType>(
 ) -> Result<ArrayRef, ArrowError> {
     let dictionaries: Vec<_> = arrays.iter().map(|x| x.as_dictionary::<K>()).collect();
     if !should_merge_dictionary_values::<K>(&dictionaries, indices.len()) {
-        return interleave_fallback(arrays, indices);
+        return interleave_fallback_dictionary::<K>(&dictionaries, indices);
     }
 
     let masks: Vec<_> = dictionaries
@@ -387,6 +388,57 @@ fn interleave_fallback(
     // emit final batch of rows
     array_data.extend(cur_array, start_row_idx, end_row_idx);
     Ok(make_array(array_data.freeze()))
+}
+
+/// interleave_fallback_dictionary is a fallback implementation for interleaving
+/// dictionaries when it was determined that the dictionary values should not
+/// be merged. This implementation concatenates the value slices and recomputes
+/// the resulting dictionary keys.
+fn interleave_fallback_dictionary<K: ArrowDictionaryKeyType>(
+    dictionaries: &[&DictionaryArray<K>],
+    indices: &[(usize, usize)],
+) -> Result<ArrayRef, ArrowError> {
+    let relative_offsets: Vec<usize> = dictionaries
+        .iter()
+        .scan(0usize, |offset, dict| {
+            let current = *offset;
+            *offset += dict.values().len();
+            Some(current)
+        })
+        .collect();
+    let all_values: Vec<&dyn Array> = dictionaries.iter().map(|d| d.values().as_ref()).collect();
+    let concatenated_values = concat(&all_values)?;
+
+    let mut has_nulls = false;
+    let new_keys: Vec<K::Native> = indices
+        .iter()
+        .map(|(a, b)| {
+            let dict = dictionaries[*a];
+            let old_keys = dict.keys();
+            if old_keys.is_valid(*b) {
+                let old_key = old_keys.values()[*b].as_usize();
+                K::Native::from_usize(relative_offsets[*a] + old_key).unwrap()
+            } else {
+                has_nulls = true;
+                K::Native::ZERO
+            }
+        })
+        .collect();
+
+    let nulls = if has_nulls {
+        let null_buffer = BooleanBuffer::collect_bool(indices.len(), |i| {
+            let (a, b) = indices[i];
+            dictionaries[a].keys().is_valid(b)
+        });
+        Some(NullBuffer::new(null_buffer))
+    } else {
+        None
+    };
+
+    let keys_array = PrimitiveArray::<K>::new(new_keys.into(), nulls);
+    // SAFETY: keys_array is constructed from a valid set of keys.
+    let array = unsafe { DictionaryArray::new_unchecked(keys_array, concatenated_values) };
+    Ok(Arc::new(array))
 }
 
 /// Interleave rows by index from multiple [`RecordBatch`] instances and return a new [`RecordBatch`].
@@ -1224,5 +1276,43 @@ mod tests {
         let v = interleave(&[&a], &[(0, 0)]).unwrap();
         assert_eq!(v.len(), 1);
         assert_eq!(v.data_type(), &DataType::Struct(fields));
+    }
+
+    #[test]
+    fn test_interleave_fallback_dictionary_with_nulls() {
+        let input_1_keys = Int32Array::from_iter([Some(0), None, Some(1)]);
+        let input_1_values = StringArray::from_iter_values(["foo", "bar"]);
+        let dict_a = DictionaryArray::new(input_1_keys, Arc::new(input_1_values));
+
+        let input_2_keys = Int32Array::from_iter([Some(0), Some(1), None]);
+        let input_2_values = StringArray::from_iter_values(["baz", "qux"]);
+        let dict_b = DictionaryArray::new(input_2_keys, Arc::new(input_2_values));
+
+        let indices = vec![
+            (0, 0), // "foo"
+            (0, 1), // null
+            (1, 0), // "baz"
+            (1, 2), // null
+            (0, 2), // "bar"
+            (1, 1), // "qux"
+        ];
+
+        let result =
+            interleave_fallback_dictionary::<Int32Type>(&[&dict_a, &dict_b], &indices).unwrap();
+        let dict_result = result.as_dictionary::<Int32Type>();
+
+        let string_result = dict_result.downcast_dict::<StringArray>().unwrap();
+        let collected: Vec<_> = string_result.into_iter().collect();
+        assert_eq!(
+            collected,
+            vec![
+                Some("foo"),
+                None,
+                Some("baz"),
+                None,
+                Some("bar"),
+                Some("qux")
+            ]
+        );
     }
 }
