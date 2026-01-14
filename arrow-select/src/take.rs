@@ -28,7 +28,7 @@ use arrow_buffer::{
     ArrowNativeType, BooleanBuffer, Buffer, MutableBuffer, NullBuffer, OffsetBuffer, ScalarBuffer,
     bit_util,
 };
-use arrow_data::ArrayDataBuilder;
+use arrow_data::{ArrayData, ArrayDataBuilder};
 use arrow_schema::{ArrowError, DataType, FieldRef, UnionMode};
 
 use num_traits::{One, Zero};
@@ -214,6 +214,10 @@ fn take_impl<IndexType: ArrowPrimitiveType>(
     values: &dyn Array,
     indices: &PrimitiveArray<IndexType>,
 ) -> Result<ArrayRef, ArrowError> {
+    if indices.is_empty() {
+        let data = ArrayData::new_empty(values.data_type());
+        return Ok(Arc::new(make_array(data)));
+    }
     downcast_primitive_array! {
         values => Ok(Arc::new(take_primitive(values, indices)?)),
         DataType::Boolean => {
@@ -2681,5 +2685,29 @@ mod tests {
             take(&values, &indices, None),
             Err(ArrowError::OffsetOverflowError(_))
         ));
+    }
+
+    #[test]
+    fn test_take_run_empty_indices() {
+        let mut builder = PrimitiveRunBuilder::<Int32Type, Int32Type>::new();
+        builder.extend([Some(1), Some(1), Some(2), Some(2)]);
+        let run_array = builder.finish();
+
+        let logical_indices: PrimitiveArray<Int32Type> = PrimitiveArray::from(Vec::<i32>::new());
+
+        let result = take_impl(&run_array, &logical_indices).expect("take_run with empty indices");
+
+        // Verify the result is a valid empty RunArray
+        assert_eq!(result.len(), 0);
+        assert_eq!(result.null_count(), 0);
+
+        // Verify that the result can be downcast and used without validation errors
+        // This specifically tests that "The values in run_ends array should be strictly positive" is not triggered
+        let run_result = result
+            .as_any()
+            .downcast_ref::<RunArray<Int32Type>>()
+            .expect("result should be a RunArray");
+        assert_eq!(run_result.run_ends().len(), 0);
+        assert_eq!(run_result.values().len(), 0);
     }
 }
