@@ -26,6 +26,7 @@ use arrow_array::*;
 use arrow_buffer::{ArrowNativeType, BooleanBuffer, MutableBuffer, NullBuffer, OffsetBuffer};
 use arrow_data::ByteView;
 use arrow_data::transform::MutableArrayData;
+use arrow_buffer::ScalarBuffer;
 use arrow_schema::{ArrowError, DataType, FieldRef, Fields};
 use std::sync::Arc;
 
@@ -108,6 +109,8 @@ pub fn interleave(
         DataType::Struct(fields) => interleave_struct(fields, values, indices),
         DataType::List(field) => interleave_list::<i32>(values, indices, field),
         DataType::LargeList(field) => interleave_list::<i64>(values, indices, field),
+        DataType::ListView(field) => interleave_list_view::<i32>(values, indices, field),
+        DataType::LargeListView(field) => interleave_list_view::<i64>(values, indices, field),
         _ => interleave_fallback(values, indices)
     }
 }
@@ -365,6 +368,51 @@ fn interleave_list<O: OffsetSizeTrait>(
     Ok(Arc::new(list_array))
 }
 
+fn interleave_list_view<O: OffsetSizeTrait>(
+    values: &[&dyn Array],
+    indices: &[(usize, usize)],
+    field: &FieldRef,
+) -> Result<ArrayRef, ArrowError> {
+    let interleaved = Interleave::<'_, GenericListViewArray<O>>::new(values, indices);
+
+    let mut capacity = 0usize;
+    let mut offsets = Vec::with_capacity(indices.len());
+    let mut sizes = Vec::with_capacity(indices.len());
+    for (array, row) in indices {
+        let s = interleaved.arrays[*array].value_sizes();
+        let element_len = s[*row].as_usize();
+        offsets.push(O::from_usize(capacity).expect("offset overflow"));
+        sizes.push(O::from_usize(element_len).expect("size overflow"));
+        capacity += element_len;
+    }
+
+    let mut child_indices = Vec::with_capacity(capacity);
+    for (array, row) in indices {
+        let list = interleaved.arrays[*array];
+        let start = list.value_offsets()[*row].as_usize();
+        let size = list.value_sizes()[*row].as_usize();
+        child_indices.extend((start..start + size).map(|i| (*array, i)));
+    }
+
+    let child_arrays: Vec<&dyn Array> = interleaved
+        .arrays
+        .iter()
+        .map(|list| list.values().as_ref())
+        .collect();
+
+    let interleaved_values = interleave(&child_arrays, &child_indices)?;
+
+    let list_view_array = GenericListViewArray::<O>::new(
+        field.clone(),
+        ScalarBuffer::from(offsets),
+        ScalarBuffer::from(sizes),
+        interleaved_values,
+        interleaved.nulls,
+    );
+
+    Ok(Arc::new(list_view_array))
+}
+
 /// Fallback implementation of interleave using [`MutableArrayData`]
 fn interleave_fallback(
     values: &[&dyn Array],
@@ -534,8 +582,11 @@ pub fn interleave_record_batch(
 mod tests {
     use super::*;
     use arrow_array::Int32RunArray;
-    use arrow_array::builder::{GenericListBuilder, Int32Builder, PrimitiveRunBuilder};
+    use arrow_array::builder::{
+        GenericListBuilder, GenericListViewBuilder, Int32Builder, PrimitiveRunBuilder,
+    };
     use arrow_array::types::Int8Type;
+    use arrow_buffer::ScalarBuffer;
     use arrow_schema::Field;
 
     #[test]
@@ -721,6 +772,123 @@ mod tests {
     #[test]
     fn test_large_lists() {
         test_interleave_lists::<i64>();
+    }
+
+    fn test_interleave_list_views<O: OffsetSizeTrait>() {
+        // [[1, 2], null, [3]]
+        let mut a = GenericListViewBuilder::<O, _>::new(Int32Builder::new());
+        a.values().append_value(1);
+        a.values().append_value(2);
+        a.append(true);
+        a.append(false);
+        a.values().append_value(3);
+        a.append(true);
+        let a = a.finish();
+
+        // [[4], null, [5, 6, null]]
+        let mut b = GenericListViewBuilder::<O, _>::new(Int32Builder::new());
+        b.values().append_value(4);
+        b.append(true);
+        b.append(false);
+        b.values().append_value(5);
+        b.values().append_value(6);
+        b.values().append_null();
+        b.append(true);
+        let b = b.finish();
+
+        let values = interleave(&[&a, &b], &[(0, 2), (0, 1), (1, 0), (1, 2), (1, 1)]).unwrap();
+        let v = values
+            .as_any()
+            .downcast_ref::<GenericListViewArray<O>>()
+            .unwrap();
+
+        // [[3], null, [4], [5, 6, null], null]
+        let mut expected = GenericListViewBuilder::<O, _>::new(Int32Builder::new());
+        expected.values().append_value(3);
+        expected.append(true);
+        expected.append(false);
+        expected.values().append_value(4);
+        expected.append(true);
+        expected.values().append_value(5);
+        expected.values().append_value(6);
+        expected.values().append_null();
+        expected.append(true);
+        expected.append(false);
+        let expected = expected.finish();
+
+        assert_eq!(v, &expected);
+    }
+
+    #[test]
+    fn test_list_views() {
+        test_interleave_list_views::<i32>();
+    }
+
+    #[test]
+    fn test_large_list_views() {
+        test_interleave_list_views::<i64>();
+    }
+
+    #[test]
+    fn test_list_view_overlapping_offsets() {
+        // Construct a ListView where multiple elements reference the same
+        // region of the underlying values buffer ("dictionary-encoded lists").
+        //
+        // Values buffer: [10, 20, 30, 40, 50, 60]
+        // Element 0: offset=0, size=3 -> [10, 20, 30]
+        // Element 1: offset=0, size=3 -> [10, 20, 30]  (same as element 0)
+        // Element 2: offset=2, size=4 -> [30, 40, 50, 60] (overlaps with 0 and 1)
+        let values = Int32Array::from(vec![10, 20, 30, 40, 50, 60]);
+        let field = Arc::new(Field::new_list_field(DataType::Int32, false));
+        let a = ListViewArray::new(
+            field.clone(),
+            ScalarBuffer::from(vec![0i32, 0, 2]),
+            ScalarBuffer::from(vec![3i32, 3, 4]),
+            Arc::new(values),
+            None,
+        );
+
+        // Values buffer: [100, 200]
+        // Element 0: offset=0, size=2 -> [100, 200]
+        let values = Int32Array::from(vec![100, 200]);
+        let b = ListViewArray::new(
+            field.clone(),
+            ScalarBuffer::from(vec![0i32]),
+            ScalarBuffer::from(vec![2i32]),
+            Arc::new(values),
+            None,
+        );
+
+        // Interleave: a[0], a[1], b[0], a[2]
+        // Expected: [10,20,30], [10,20,30], [100,200], [30,40,50,60]
+        let result = interleave(
+            &[&a as &dyn Array, &b as &dyn Array],
+            &[(0, 0), (0, 1), (1, 0), (0, 2)],
+        )
+        .unwrap();
+        let result = result.as_any().downcast_ref::<ListViewArray>().unwrap();
+
+        assert_eq!(result.len(), 4);
+
+        // Element 0: [10, 20, 30]
+        let v = result.value(0);
+        let v = v.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(v.values(), &[10, 20, 30]);
+
+        // Element 1: [10, 20, 30] (was overlapping with element 0 in source)
+        let v = result.value(1);
+        let v = v.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(v.values(), &[10, 20, 30]);
+
+        // Element 2: [100, 200]
+        let v = result.value(2);
+        let v = v.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(v.values(), &[100, 200]);
+
+        // Element 3: [30, 40, 50, 60] (was overlapping with elements 0,1 in source)
+        let v = result.value(3);
+        let v = v.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(v.values(), &[30, 40, 50, 60]);
     }
 
     #[test]

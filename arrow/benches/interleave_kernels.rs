@@ -28,6 +28,9 @@ extern crate arrow;
 use arrow::datatypes::*;
 use arrow::util::test_util::seedable_rng;
 use arrow::{array::*, util::bench_util::*};
+use arrow_array::builder::{GenericListViewBuilder, Int64Builder};
+use arrow_array::types::Int64Type;
+use arrow_buffer::OffsetSizeTrait;
 use arrow_select::interleave::interleave;
 use std::hint;
 use std::sync::Arc;
@@ -65,6 +68,30 @@ fn bench_values(c: &mut Criterion, name: &str, len: usize, values: &[&dyn Array]
     c.bench_function(name, |b| {
         b.iter(|| hint::black_box(interleave(values, &indices).unwrap()))
     });
+}
+
+fn create_list_view_array<O: OffsetSizeTrait>(
+    size: usize,
+    null_density: f32,
+    list_len: usize,
+) -> GenericListViewArray<O> {
+    let mut rng = seedable_rng();
+    let mut builder = GenericListViewBuilder::<O, _>::new(Int64Builder::new());
+    for _ in 0..size {
+        if rng.random::<f32>() < null_density {
+            builder.append(false);
+        } else {
+            for _ in 0..list_len {
+                if rng.random::<f32>() < null_density {
+                    builder.values().append_null();
+                } else {
+                    builder.values().append_value(rng.random::<i64>());
+                }
+            }
+            builder.append(true);
+        }
+    }
+    builder.finish()
 }
 
 fn add_benchmark(c: &mut Criterion) {
@@ -120,6 +147,8 @@ fn add_benchmark(c: &mut Criterion) {
     let list_i64 = create_primitive_list_array_with_seed::<i32, Int64Type>(8192, 0.1, 0.1, 20, 42);
     let list_i64_no_nulls =
         create_primitive_list_array_with_seed::<i32, Int64Type>(8192, 0.0, 0.0, 20, 42);
+    let list_view_i64 = create_list_view_array::<i32>(1024, 0., 20);
+    let list_view_i64_opt = create_list_view_array::<i32>(1024, 0.1, 20);
 
     let cases: &[(&str, &dyn Array)] = &[
         ("i32(0.0)", &i32),
@@ -143,6 +172,8 @@ fn add_benchmark(c: &mut Criterion) {
         ),
         ("list<i64>(0.1,0.1,20)", &list_i64),
         ("list<i64>(0.0,0.0,20)", &list_i64_no_nulls),
+        ("list_view<i64>(0.0,0.0,20)", &list_view_i64),
+        ("list_view<i64>(0.1,0.1,20)", &list_view_i64_opt),
     ];
 
     for (prefix, base) in cases {
