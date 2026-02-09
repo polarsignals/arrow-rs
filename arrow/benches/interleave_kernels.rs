@@ -28,9 +28,13 @@ extern crate arrow;
 use arrow::datatypes::*;
 use arrow::util::test_util::seedable_rng;
 use arrow::{array::*, util::bench_util::*};
-use arrow_array::builder::{GenericListViewBuilder, Int64Builder};
+use arrow_array::builder::{
+    BooleanBufferBuilder, GenericListViewBuilder, Int32Builder, Int64Builder,
+    StringDictionaryBuilder,
+};
 use arrow_array::types::Int64Type;
-use arrow_buffer::OffsetSizeTrait;
+use arrow_array::OffsetSizeTrait;
+use arrow_buffer::ScalarBuffer;
 use arrow_select::interleave::interleave;
 use std::hint;
 use std::sync::Arc;
@@ -94,6 +98,70 @@ fn create_list_view_array<O: OffsetSizeTrait>(
     builder.finish()
 }
 
+/// Creates a ListView<Struct<dict_str, i32>> array.
+/// Each list element is a struct with a dictionary-encoded string field and an i32 field.
+fn create_list_view_struct_dict_array(
+    size: usize,
+    null_density: f32,
+    list_len: usize,
+) -> ListViewArray {
+    let mut rng = seedable_rng();
+
+    // Build the child struct arrays: total child length = size * list_len (approx)
+    let mut dict_builder = StringDictionaryBuilder::<Int32Type>::new();
+    let mut int_builder = Int32Builder::new();
+    let dict_values = ["alpha", "beta", "gamma", "delta", "epsilon"];
+
+    let mut offsets = Vec::with_capacity(size);
+    let mut sizes = Vec::with_capacity(size);
+    let mut null_buf = BooleanBufferBuilder::new(size);
+    let mut child_len = 0usize;
+
+    for _ in 0..size {
+        if rng.random::<f32>() < null_density {
+            offsets.push(child_len as i32);
+            sizes.push(0i32);
+            null_buf.append(false);
+        } else {
+            offsets.push(child_len as i32);
+            sizes.push(list_len as i32);
+            null_buf.append(true);
+            for _ in 0..list_len {
+                let v = dict_values[rng.random_range(0..dict_values.len())];
+                if rng.random::<f32>() < null_density {
+                    dict_builder.append_null();
+                } else {
+                    dict_builder.append_value(v);
+                }
+                if rng.random::<f32>() < null_density {
+                    int_builder.append_null();
+                } else {
+                    int_builder.append_value(rng.random::<i32>());
+                }
+            }
+            child_len += list_len;
+        }
+    }
+
+    let dict_array = Arc::new(dict_builder.finish()) as ArrayRef;
+    let int_array = Arc::new(int_builder.finish()) as ArrayRef;
+
+    let struct_fields = Fields::from(vec![
+        Field::new("d", dict_array.data_type().clone(), true),
+        Field::new("i", DataType::Int32, true),
+    ]);
+    let struct_array = StructArray::new(struct_fields.clone(), vec![dict_array, int_array], None);
+
+    let field = Arc::new(Field::new_struct("item", struct_fields, true));
+    ListViewArray::new(
+        field,
+        ScalarBuffer::from(offsets),
+        ScalarBuffer::from(sizes),
+        Arc::new(struct_array),
+        Some(null_buf.finish().into()),
+    )
+}
+
 fn add_benchmark(c: &mut Criterion) {
     let i32 = create_primitive_array::<Int32Type>(1024, 0.);
     let i32_opt = create_primitive_array::<Int32Type>(1024, 0.5);
@@ -149,6 +217,8 @@ fn add_benchmark(c: &mut Criterion) {
         create_primitive_list_array_with_seed::<i32, Int64Type>(8192, 0.0, 0.0, 20, 42);
     let list_view_i64 = create_list_view_array::<i32>(1024, 0., 20);
     let list_view_i64_opt = create_list_view_array::<i32>(1024, 0.1, 20);
+    let list_view_struct_dict = create_list_view_struct_dict_array(1024, 0.0, 20);
+    let list_view_struct_dict_opt = create_list_view_struct_dict_array(1024, 0.1, 20);
 
     let cases: &[(&str, &dyn Array)] = &[
         ("i32(0.0)", &i32),
@@ -174,6 +244,8 @@ fn add_benchmark(c: &mut Criterion) {
         ("list<i64>(0.0,0.0,20)", &list_i64_no_nulls),
         ("list_view<i64>(0.0,0.0,20)", &list_view_i64),
         ("list_view<i64>(0.1,0.1,20)", &list_view_i64_opt),
+        ("list_view<struct(dict,i32)>(0.0,20)", &list_view_struct_dict),
+        ("list_view<struct(dict,i32)>(0.1,20)", &list_view_struct_dict_opt),
     ];
 
     for (prefix, base) in cases {

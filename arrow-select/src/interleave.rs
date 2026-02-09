@@ -375,42 +375,47 @@ fn interleave_list_view<O: OffsetSizeTrait>(
 ) -> Result<ArrayRef, ArrowError> {
     let interleaved = Interleave::<'_, GenericListViewArray<O>>::new(values, indices);
 
-    let mut capacity = 0usize;
-    let mut offsets = Vec::with_capacity(indices.len());
-    let mut sizes = Vec::with_capacity(indices.len());
-    for (array, row) in indices {
-        let s = interleaved.arrays[*array].value_sizes();
-        let element_len = s[*row].as_usize();
-        offsets.push(O::from_usize(capacity).expect("offset overflow"));
-        sizes.push(O::from_usize(element_len).expect("size overflow"));
-        capacity += element_len;
-    }
-
-    let mut child_indices = Vec::with_capacity(capacity);
-    for (array, row) in indices {
-        let list = interleaved.arrays[*array];
-        let start = list.value_offsets()[*row].as_usize();
-        let size = list.value_sizes()[*row].as_usize();
-        child_indices.extend((start..start + size).map(|i| (*array, i)));
-    }
-
+    // Concat the child value arrays from each input list array.
+    // This is only `num_arrays` inputs (typically 2-8), not `num_indices`.
     let child_arrays: Vec<&dyn Array> = interleaved
         .arrays
         .iter()
         .map(|list| list.values().as_ref())
         .collect();
+    let concatenated_values = concat(&child_arrays)?;
 
-    let interleaved_values = interleave(&child_arrays, &child_indices)?;
+    // Compute the base offset for each input array's children within the
+    // concatenated child array (cumulative sum of child array lengths).
+    let base_offsets: Vec<usize> = interleaved
+        .arrays
+        .iter()
+        .scan(0usize, |cumulative, list| {
+            let base = *cumulative;
+            *cumulative += list.values().len();
+            Some(base)
+        })
+        .collect();
 
-    let list_view_array = GenericListViewArray::<O>::new(
+    // Remap offsets: for each selected element, its offset in the concatenated
+    // child is its original offset + the base offset for its source array.
+    // Sizes are unchanged.
+    let mut offsets = Vec::with_capacity(indices.len());
+    let mut sizes = Vec::with_capacity(indices.len());
+    for &(array, row) in indices {
+        let list = interleaved.arrays[array];
+        let original_offset = list.value_offsets()[row].as_usize();
+        let new_offset = base_offsets[array] + original_offset;
+        offsets.push(O::from_usize(new_offset).expect("offset overflow"));
+        sizes.push(list.value_sizes()[row]);
+    }
+
+    Ok(Arc::new(GenericListViewArray::<O>::new(
         field.clone(),
         ScalarBuffer::from(offsets),
         ScalarBuffer::from(sizes),
-        interleaved_values,
+        concatenated_values,
         interleaved.nulls,
-    );
-
-    Ok(Arc::new(list_view_array))
+    )))
 }
 
 /// Fallback implementation of interleave using [`MutableArrayData`]

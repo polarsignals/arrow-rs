@@ -27,21 +27,21 @@ pub(super) fn build_extend<T: ArrowNativeType + Integer + CheckedAdd>(
     let offsets = array.buffer::<T>(0);
     let sizes = array.buffer::<T>(1);
     Box::new(
-        move |mutable: &mut _MutableArrayData, _index: usize, start: usize, len: usize| {
+        move |mutable: &mut _MutableArrayData, index: usize, start: usize, len: usize| {
             let offset_buffer = &mut mutable.buffer1;
             let sizes_buffer = &mut mutable.buffer2;
 
-            for &offset in &offsets[start..start + len] {
-                offset_buffer.push(offset);
+            for i in start..start + len {
+                let child_start = offsets[i].as_usize();
+                let child_len = sizes[i].as_usize();
+                // The new offset points to the current end of the child data.
+                let new_offset = T::from_usize(mutable.child_data[0].len()).unwrap();
+                offset_buffer.push(new_offset);
+                sizes_buffer.push(sizes[i]);
+                if child_len > 0 {
+                    mutable.child_data[0].extend(index, child_start, child_start + child_len);
+                }
             }
-
-            // sizes
-            for &size in &sizes[start..start + len] {
-                sizes_buffer.push(size);
-            }
-
-            // the beauty of views is that we don't need to copy child_data, we just splat
-            // the offsets and sizes.
         },
     )
 }
@@ -50,7 +50,8 @@ pub(super) fn extend_nulls<T: ArrowNativeType>(mutable: &mut _MutableArrayData, 
     let offset_buffer = &mut mutable.buffer1;
     let sizes_buffer = &mut mutable.buffer2;
 
-    // We push 0 as a placeholder for NULL values in both the offsets and sizes
-    (0..len).for_each(|_| offset_buffer.push(T::default()));
-    (0..len).for_each(|_| sizes_buffer.push(T::default()));
+    (0..len).for_each(|_| {
+        offset_buffer.push(T::default());
+        sizes_buffer.push(T::default());
+    });
 }
